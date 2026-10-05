@@ -51,6 +51,13 @@ prompt the user typed. Turns represent API usage, so a queued prompt with no fol
 assistant API call is omitted, just like an ordinary user message with no
 assistant call.
 
+Ordinary `user` records marked `isMeta: true`, `isCompactSummary: true`, or with
+an `origin.kind` other than `human` are also harness records. They do not split
+the active human turn; assistant API calls after them remain billed under that
+turn, or under an implicit usage-bearing turn when the transcript has no human
+prompt yet. The parser uses these recorded fields for attribution and does not
+guess from slash-prefixed text, which can contain a real filesystem path.
+
 ## Pricing
 
 Claude Code reports total cache-write tokens in `usage.cache_creation_input_tokens`.

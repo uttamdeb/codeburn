@@ -1016,8 +1016,8 @@ const MAX_TOOL_BLOCKS = 500
 const MAX_ADDED_NAMES = 1000
 const QUEUED_SLASH_COMMAND = /^\/[a-z][\w:.-]*(?:\s|$)/
 
-// Peer and agent-message queued commands (`isMeta: true`, `origin.kind: "peer"`)
-// are queue plumbing between agents, not a prompt the user typed.
+// Queued prompts use the same human-origin markers as ordinary user records;
+// keep only explicitly human or unmarked prompts.
 function isHumanQueuedPrompt(a: Record<string, unknown>): boolean {
   return a['type'] === 'queued_command' && a['commandMode'] === 'prompt'
     && isHumanPromptMetadata(a)

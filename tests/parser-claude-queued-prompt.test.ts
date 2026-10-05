@@ -84,6 +84,32 @@ describe('Claude queued human prompts', () => {
 
     const missingOrigin = compactEntry(attachment('2026-07-01T10:00:03Z', 'queued_command', 'prompt', 'no origin field'))
     expect((missingOrigin['attachment'] as Record<string, unknown>)['prompt']).toBe('no origin field')
+
+    const nonhuman = compactEntry({
+      type: 'attachment',
+      timestamp: '2026-07-01T10:00:03Z',
+      sessionId: 'session-1',
+      attachment: {
+        type: 'queued_command',
+        commandMode: 'prompt',
+        prompt: 'background task notification',
+        origin: { kind: 'task-notification' },
+      },
+    } as JournalEntry)
+    expect(nonhuman['attachment']).toBeUndefined()
+
+    const compactSummary = compactEntry({
+      type: 'attachment',
+      timestamp: '2026-07-01T10:00:03Z',
+      sessionId: 'session-1',
+      attachment: {
+        type: 'queued_command',
+        commandMode: 'prompt',
+        prompt: 'summary replay',
+        isCompactSummary: true,
+      },
+    } as JournalEntry)
+    expect(compactSummary['attachment']).toBeUndefined()
   })
 
   it('starts a separate turn for a typed queued prompt and ignores other attachments', () => {

@@ -154,6 +154,40 @@ describe('incremental append parsing', () => {
     await rm(warmCache, { recursive: true, force: true })
   })
 
+  it('CLAUDE: an appended harness user record keeps its reply in the active human turn', async () => {
+    const warmCache = await mkdtemp(join(tmpdir(), 'incr-claude-harness-'))
+    await writeFile(sessionPath,
+      userLine('2026-05-01T10:00:01.000Z', 'Implement a parser change') + '\n' +
+      asstLine('msg-human', '2026-05-01T10:00:02.000Z', { input_tokens: 100, output_tokens: 20 }) + '\n')
+    await parseWith(warmCache)
+
+    const cachedOffset = (await readCacheOnDisk())
+      .providers['claude']!.files[sessionPath]!.lastCompleteLineOffset!
+    await appendFile(sessionPath,
+      JSON.stringify({
+        type: 'user',
+        sessionId: 'sess-1',
+        timestamp: '2026-05-01T10:05:00.000Z',
+        cwd: CWD,
+        isMeta: true,
+        message: { role: 'user', content: 'Task notification: the background task is complete' },
+      }) + '\n' +
+      asstLine('msg-after-harness', '2026-05-01T10:05:02.000Z', { input_tokens: 50, output_tokens: 10 }) + '\n')
+
+    readLineCalls.length = 0
+    const warm = await parseWith(warmCache)
+    expect(offsetsFor(sessionPath)).toContain(cachedOffset)
+    const cold = await coldFullReparse()
+    expect(warm).toEqual(cold)
+
+    const turns = warm.flatMap(project => project.sessions).find(session => session.sessionId === 'sess-1')!.turns
+    expect(turns).toHaveLength(1)
+    expect(turns[0]!.userMessage).toBe('Implement a parser change')
+    expect(turns[0]!.assistantCalls.map(call => call.deduplicationKey)).toEqual(['msg-human', 'msg-after-harness'])
+    expect(turns[0]!.assistantCalls.reduce((sum, call) => sum + call.usage.inputTokens, 0)).toBe(150)
+    await rm(warmCache, { recursive: true, force: true })
+  })
+
   it('PR-REFS: survive the incremental append path (continuation merge unions refs)', async () => {
     const warmCache = await mkdtemp(join(tmpdir(), 'incr-pr-'))
     // Base: one turn that creates PR-1.

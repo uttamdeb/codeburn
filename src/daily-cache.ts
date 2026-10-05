@@ -256,7 +256,10 @@ import type { DateRange, ProjectSummary } from './types.js'
 // miss sessions there and must be re-derived after the default path is fixed.
 // v51: honor redirected Copilot and Cursor editor data roots. Backfill settled
 // days that previously missed usage stored under APPDATA or XDG_CONFIG_HOME.
-export const DAILY_CACHE_VERSION = 51
+// v52: Claude harness user records no longer create turn boundaries, changing
+// settled category totals. Re-derive from the reparsed session cache; calls and
+// usage stay the same.
+export const DAILY_CACHE_VERSION = 52
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at
