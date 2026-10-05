@@ -313,17 +313,14 @@ function getRawJsonNumberField(head: string, field: string): number | undefined 
   return Number.isFinite(value) ? value : undefined
 }
 
-function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4096): string | undefined {
-  const payloadKey = Buffer.from('"payload"')
-  const payloadIndex = source.indexOf(payloadKey)
-  if (payloadIndex < 0) return undefined
-  let payloadStart = source.indexOf(0x7b, payloadIndex + payloadKey.length) // {
-  if (payloadStart < 0) return undefined
+type RawJsonFieldBounds = { keyStart: number; valueStart: number }
 
+function findRawObjectField(source: Buffer, objectStart: number, field: string): RawJsonFieldBounds | undefined {
+  const fieldBytes = Buffer.from(field, 'utf-8')
   let depth = 0
   let inString = false
   let escaped = false
-  for (let i = payloadStart; i < source.length; i++) {
+  for (let i = objectStart; i < source.length; i++) {
     const byte = source[i]!
     if (inString) {
       if (escaped) escaped = false
@@ -342,11 +339,16 @@ function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4
         if (keyByte === 0x22) break
       }
       if (depth === 1 && keyEnd < source.length) {
-        const key = source.subarray(keyStart, keyEnd).toString('utf-8')
-        let valueStart = keyEnd + 1
-        while (valueStart < source.length && (source[valueStart] === 0x20 || source[valueStart] === 0x09 || source[valueStart] === 0x0a || source[valueStart] === 0x0d)) valueStart++
-        if (source[valueStart] === 0x3a && key === field) {
-          return source.subarray(i, Math.min(source.length, i + windowBytes)).toString('utf-8')
+        // Most strings at depth 1 are values, including potentially huge
+        // image results. Check for the key/value delimiter and exact short-key
+        // length before comparing bytes so scanning never materializes them.
+        let colon = keyEnd + 1
+        while (colon < source.length && (source[colon] === 0x20 || source[colon] === 0x09 || source[colon] === 0x0a || source[colon] === 0x0d)) colon++
+        if (source[colon] === 0x3a && keyEnd - keyStart === fieldBytes.length && source.subarray(keyStart, keyEnd).equals(fieldBytes)) {
+          let valueStart = colon
+          valueStart++
+          while (valueStart < source.length && (source[valueStart] === 0x20 || source[valueStart] === 0x09 || source[valueStart] === 0x0a || source[valueStart] === 0x0d)) valueStart++
+          return { keyStart: i, valueStart }
         }
       }
       i = keyEnd
@@ -356,9 +358,35 @@ function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4
     if (byte === 0x22) inString = true
     else if (byte === 0x7b || byte === 0x5b) depth++ // { or [
     else if (byte === 0x7d || byte === 0x5d) depth-- // } or ]
-    if (depth < 0) break
+    if (depth <= 0) break
   }
   return undefined
+}
+
+function getRawObjectFieldWindow(source: Buffer, objectStart: number, field: string, windowBytes = 4096): string | undefined {
+  const bounds = findRawObjectField(source, objectStart, field)
+  return bounds ? source.subarray(bounds.keyStart, Math.min(source.length, bounds.keyStart + windowBytes)).toString('utf-8') : undefined
+}
+
+function getRawPayloadObjectStart(source: Buffer): number | undefined {
+  const payloadKey = Buffer.from('"payload"')
+  const payloadIndex = source.indexOf(payloadKey)
+  if (payloadIndex < 0) return undefined
+  const payloadStart = source.indexOf(0x7b, payloadIndex + payloadKey.length) // {
+  return payloadStart < 0 ? undefined : payloadStart
+}
+
+function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4096): string | undefined {
+  const payloadStart = getRawPayloadObjectStart(source)
+  return payloadStart === undefined ? undefined : getRawObjectFieldWindow(source, payloadStart, field, windowBytes)
+}
+
+function getRawPayloadItemFieldWindow(source: Buffer, field: string, windowBytes = 4096): string | undefined {
+  const payloadStart = getRawPayloadObjectStart(source)
+  if (payloadStart === undefined) return undefined
+  const item = findRawObjectField(source, payloadStart, 'item')
+  if (!item || source[item.valueStart] !== 0x7b) return undefined
+  return getRawObjectFieldWindow(source, item.valueStart, field, windowBytes)
 }
 
 function getRawDurationMs(head: string): number | undefined {
@@ -528,14 +556,28 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
   const compactModelName = getRawJsonStringField(pHead, 'model_name')
   const compactLastUsage = getRawTokenUsage(pHead, 'last_token_usage')
   const compactTotalUsage = getRawTokenUsage(pHead, 'total_token_usage')
-  const itemWindow = type === 'event_msg' && payloadType === 'item_completed'
-    ? getRawPayloadFieldWindow(line, 'item')
+  const itemTypeWindow = type === 'event_msg' && payloadType === 'item_completed'
+    ? getRawPayloadItemFieldWindow(line, 'type')
     : undefined
-  const compactItemType = itemWindow ? getRawJsonStringField(itemWindow, 'type') : undefined
-  const compactItemId = itemWindow ? getRawJsonStringField(itemWindow, 'id') : undefined
+  const itemIdWindow = type === 'event_msg' && payloadType === 'item_completed'
+    ? getRawPayloadItemFieldWindow(line, 'id')
+    : undefined
+  const compactItemType = itemTypeWindow ? getRawJsonStringField(itemTypeWindow, 'type') : undefined
+  const compactItemId = itemIdWindow ? getRawJsonStringField(itemIdWindow, 'id') : undefined
   const compactItem = compactItemType
     ? { type: compactItemType, ...(compactItemId ? { id: compactItemId } : {}) }
     : undefined
+  const isNativeResponseTool = type === 'response_item' && (
+    payloadType === 'web_search_call' || payloadType === 'tool_search_call' || payloadType === 'image_generation_call'
+  )
+  const nativeIdWindow = isNativeResponseTool ? getRawPayloadFieldWindow(line, 'id') : undefined
+  const nativeCallIdWindow = isNativeResponseTool ? getRawPayloadFieldWindow(line, 'call_id') : undefined
+  const compactId = isNativeResponseTool
+    ? nativeIdWindow ? getRawJsonStringField(nativeIdWindow, 'id') : undefined
+    : getRawJsonStringField(pHead, 'id')
+  const compactCallId = isNativeResponseTool
+    ? nativeCallIdWindow ? getRawJsonStringField(nativeCallIdWindow, 'call_id') : undefined
+    : getRawJsonStringField(pHead, 'call_id')
   const compactInfo = compactModel || compactModelName || compactLastUsage || compactTotalUsage
     ? { model: compactModel, model_name: compactModelName, last_token_usage: compactLastUsage, total_token_usage: compactTotalUsage }
     : undefined
@@ -546,7 +588,7 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
     timestamp: getRawJsonStringField(head, 'timestamp'),
     payload: {
       type: payloadType,
-      id: getRawJsonStringField(pHead, 'id'),
+      id: compactId,
       role,
       cwd: payloadString('cwd'),
       model_provider: payloadString('model_provider'),
@@ -560,7 +602,7 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
       name: payloadString('name'),
       item: compactItem,
       invocation,
-      call_id: getRawJsonStringField(pHead, 'call_id'),
+      call_id: compactCallId,
       turn_id: getRawJsonStringField(pHead, 'turn_id'),
       // On mcp_tool_call_end a coincidental `duration_ms` inside the large
       // invocation.arguments object can shadow the payload-level duration, so the
