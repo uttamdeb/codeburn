@@ -578,7 +578,9 @@ describe('ensureCacheHydrated: Codex usage-record accounting migration', () => {
 })
 
 describe('ensureCacheHydrated: Claude queued prompt categories', () => {
-  it.each([39, 43, DAILY_CACHE_VERSION - 1])('re-derives a settled v%i day when turns are reclassified but calls stay equal', async sourceVersion => {
+  // v51 is the shipped cache before human-boundary regrouping. Pin it so this
+  // case fails if the required migration bump is accidentally removed.
+  it.each([39, 43, 51])('re-derives a settled v%i day when turns are reclassified but calls stay equal', async sourceVersion => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-09-27T12:00:00.000Z'))
 
