@@ -13,6 +13,7 @@ import { createHash } from 'crypto'
 import { join } from 'path'
 
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
+import { CODEX_CACHE_VERSION, clearCodexMemCaches, codexCacheFileName } from '../src/codex-cache.js'
 import type { SessionCache } from '../src/session-cache.js'
 import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
@@ -36,6 +37,15 @@ function preFixFingerprint(): string {
 // Exact fingerprint emitted before token_usage_record accounting was added.
 function preUsageRecordFingerprint(): string {
   const parseVersion = 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1'
+  return createHash('sha256')
+    .update(`CODEX_HOME=${CODEX_HOME}\0parser=${parseVersion}`)
+    .digest('hex')
+    .slice(0, 16)
+}
+
+// Fingerprint emitted before namespace-aware function_call attribution was added.
+function preMcpNamespaceFingerprint(): string {
+  const parseVersion = 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1-fork-replay-burst-v1-codex-token-usage-record-v1'
   return createHash('sha256')
     .update(`CODEX_HOME=${CODEX_HOME}\0parser=${parseVersion}`)
     .digest('hex')
@@ -117,6 +127,52 @@ describe('codex parser change invalidates stale session-cache (#478/#513)', () =
     // envFingerprint no longer matches, the stale section is discarded, the
     // unchanged file re-parses, and the mcp-cli attribution reappears.
     expect(allMcpServers(second)).toContain('github')
+  })
+
+  it('re-parses unchanged codex files after MCP namespace attribution changes', async () => {
+    const sessionDir = join(CODEX_HOME, 'sessions', '2026', '10', '05')
+    await mkdir(sessionDir, { recursive: true })
+    await mkdir(CACHE_DIR, { recursive: true })
+    const lines = [
+      JSON.stringify({ type: 'session_meta', timestamp: '2026-10-05T10:00:00Z', payload: { session_id: 'sess-mcp-namespace-cache', model: 'gpt-5.5', cwd: '/Users/test/proj', originator: 'codex_cli_rs' } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-10-05T10:00:10Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'list fixture resources' }] } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-10-05T10:00:30Z', payload: { type: 'function_call', namespace: 'mcp__fixture', name: 'list_resources', call_id: 'mcp-namespace-cache', arguments: '{}' } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-10-05T10:01:00Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 300, output_tokens: 100 }, total_token_usage: { total_tokens: 400 } } } }),
+    ]
+    await writeFile(join(sessionDir, 'rollout-mcp-namespace-cache.jsonl'), lines.join('\n') + '\n')
+
+    clearSessionCache()
+    clearCodexMemCaches()
+    await parseAllSessions(undefined, 'codex')
+
+    // Simulate the previous provider parser's warm session-cache attribution.
+    // It preserved the generic function name but had no MCP server identity.
+    const cache = await readCacheOnDisk() as SessionCache
+    const codex = cache.providers['codex']
+    expect(codex).toBeDefined()
+    codex!.envFingerprint = preMcpNamespaceFingerprint()
+    for (const file of Object.values(codex!.files)) {
+      for (const turn of file.turns) {
+        for (const call of turn.calls) {
+          call.tools = ['list_resources']
+          call.toolSequence = [[{ tool: 'list_resources' }]]
+        }
+      }
+    }
+    await writeCacheOnDisk(cache)
+
+    // The session parser is the authoritative invalidation gate for the outer
+    // cache; stale Codex result entries must also be rejected after its version
+    // bump so reparsing reaches the source JSONL.
+    const codexCachePath = join(CACHE_DIR, codexCacheFileName())
+    const codexCache = JSON.parse(await readFile(codexCachePath, 'utf8')) as { version: number; files: Record<string, unknown> }
+    codexCache.version = CODEX_CACHE_VERSION - 1
+    await writeFile(codexCachePath, JSON.stringify(codexCache))
+    clearSessionCache()
+    clearCodexMemCaches()
+
+    const migrated = await parseAllSessions(undefined, 'codex')
+    expect(allMcpServers(migrated)).toContain('fixture')
   })
 
   it('re-parses warm session-cache turns after token_usage_record accounting changes', async () => {

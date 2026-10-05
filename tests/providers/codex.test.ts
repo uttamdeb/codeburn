@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm, stat } from 'fs/promises'
+import { appendFile, mkdtemp, mkdir, writeFile, rm, stat } from 'fs/promises'
 import { basename, join } from 'path'
 import { tmpdir } from 'os'
 
-import { createCodexProvider } from '../../src/providers/codex.js'
+import { createCodexProvider, parseCodexFileFull } from '../../src/providers/codex.js'
 import { clearCodexMemCaches, CODEX_CACHE_VERSION, codexCacheFileName } from '../../src/codex-cache.js'
 import { calculateCost } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
@@ -88,21 +88,27 @@ function tokenUsageRecord(opts: {
   })
 }
 
-function functionCall(name: string, timestamp?: string) {
+function functionCall(name: string, timestamp?: string, opts: { namespace?: string; callId?: string; arguments?: unknown } = {}) {
   return JSON.stringify({
     type: 'response_item',
     timestamp: timestamp ?? '2026-04-14T10:00:30Z',
-    payload: { type: 'function_call', name },
+    payload: {
+      type: 'function_call',
+      name,
+      ...(opts.namespace ? { namespace: opts.namespace } : {}),
+      ...(opts.callId ? { call_id: opts.callId } : {}),
+      ...(opts.arguments !== undefined ? { arguments: opts.arguments } : {}),
+    },
   })
 }
 
-function mcpToolCallEnd(server: string, tool: string, timestamp?: string) {
+function mcpToolCallEnd(server: string, tool: string, timestamp?: string, callId = 'call-1') {
   return JSON.stringify({
     type: 'event_msg',
     timestamp: timestamp ?? '2026-04-14T10:00:30Z',
     payload: {
       type: 'mcp_tool_call_end',
-      call_id: 'call-1',
+      call_id: callId,
       invocation: { server, tool, arguments: {} },
       duration: '1.2s',
       result: { Ok: { content: [] } },
@@ -861,6 +867,105 @@ describe('codex provider - JSONL parsing', () => {
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.tools).toEqual(['mcp__github__get_issue'])
+  })
+
+  it('uses MCP function namespaces while preserving aliases and qualified names', async () => {
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-namespace.jsonl', [
+      sessionMeta({ session_id: 'sess-mcp-namespace', model: 'gpt-5.5' }),
+      userMessage('use the fixture MCP server'),
+      functionCall('list_resources', '2026-04-14T10:00:30Z', { namespace: 'mcp__fixture', callId: 'mcp-list' }),
+      // A namespaced MCP name that collides with a Codex shell alias is still
+      // an MCP tool, never Bash.
+      functionCall('exec_command', '2026-04-14T10:00:31Z', { namespace: 'mcp__fixture', callId: 'mcp-exec' }),
+      // A provider that already supplies a qualified name must not be prefixed again.
+      functionCall('mcp__fixture__already_qualified', '2026-04-14T10:00:32Z', { namespace: 'mcp__fixture' }),
+      // Non-MCP namespaces keep the existing plain-name behavior.
+      functionCall('list_resources', '2026-04-14T10:00:33Z', { namespace: 'functions' }),
+      functionCall('exec_command', '2026-04-14T10:00:34Z'),
+      // Some rollouts can carry both representations of one execution.
+      // Matching call IDs must not double-count the MCP tool.
+      mcpToolCallEnd('fixture', 'list_resources', '2026-04-14T10:00:35Z', 'mcp-list'),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual([
+      'mcp__fixture__list_resources',
+      'mcp__fixture__exec_command',
+      'mcp__fixture__already_qualified',
+      'list_resources',
+      'Bash',
+    ])
+  })
+
+  it('reads an MCP namespace from a large function_call record', async () => {
+    const largeFunctionCall = functionCall('list_resources', '2026-04-14T10:00:30Z', {
+      namespace: 'mcp__fixture',
+      callId: 'mcp-large',
+      arguments: { body: 'x'.repeat(80_000) },
+    })
+    expect(Buffer.byteLength(largeFunctionCall)).toBeGreaterThan(64 * 1024)
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-namespace-large.jsonl', [
+      sessionMeta({ session_id: 'sess-mcp-namespace-large', model: 'gpt-5.5' }),
+      userMessage('use the fixture MCP server'),
+      largeFunctionCall,
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['mcp__fixture__list_resources'])
+  })
+
+  it('keeps MCP namespace attribution identical on full and append parsing', async () => {
+    const previousCacheDir = process.env['CODEBURN_CACHE_DIR']
+    process.env['CODEBURN_CACHE_DIR'] = join(tmpDir, 'mcp-append-cache')
+    clearCodexMemCaches()
+    try {
+      const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-namespace-append.jsonl', [
+        sessionMeta({ session_id: 'sess-mcp-namespace-append', model: 'gpt-5.5' }),
+        JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:01Z', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+        userMessage('first MCP request'),
+        functionCall('list_resources', '2026-04-14T10:00:30Z', { namespace: 'mcp__fixture', callId: 'mcp-first' }),
+        tokenCount({ timestamp: '2026-04-14T10:00:40Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+        JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:41Z', payload: { type: 'task_complete', duration_ms: 40_000 } }),
+      ])
+      const source = { path: filePath, project: 'test', provider: 'codex' }
+      const provider = createCodexProvider(tmpDir)
+      const firstParse: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) firstParse.push(call)
+      expect(firstParse.map(call => call.tools)).toEqual([['mcp__fixture__list_resources']])
+
+      await appendFile(filePath, [
+        JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:01:01Z', payload: { type: 'task_started', turn_id: 'turn-2' } }),
+        userMessage('second MCP request', '2026-04-14T10:01:02Z'),
+        functionCall('get_status', '2026-04-14T10:01:30Z', { namespace: 'mcp__fixture', callId: 'mcp-second' }),
+        tokenCount({ timestamp: '2026-04-14T10:01:40Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+        JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:01:41Z', payload: { type: 'task_complete', duration_ms: 40_000 } }),
+      ].join('\n') + '\n')
+
+      const appended: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) appended.push(call)
+      const full = await parseCodexFileFull(source, new Set())
+
+      expect(appended).toHaveLength(2)
+      expect(appended.map(call => call.tools)).toEqual([
+        ['mcp__fixture__list_resources'],
+        ['mcp__fixture__get_status'],
+      ])
+      expect(appended.map(call => call.tools)).toEqual(full.calls.map(call => call.tools))
+    } finally {
+      clearCodexMemCaches()
+      if (previousCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
+      else process.env['CODEBURN_CACHE_DIR'] = previousCacheDir
+    }
   })
 
   it('subtracts native MCP wait time from active timing', async () => {
