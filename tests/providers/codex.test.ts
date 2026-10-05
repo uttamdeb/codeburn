@@ -965,6 +965,78 @@ describe('codex provider - JSONL parsing', () => {
     })
   })
 
+  it.each([
+    ['missing duration', undefined],
+    ['zero duration', 0],
+  ] as const)('recovers reverse-ordered MCP wait when the end record has %s', async (_label, durationMs) => {
+    const endPayload = {
+      type: 'mcp_tool_call_end',
+      call_id: 'mcp-no-duration',
+      invocation: { server: 'fixture', tool: 'list_resources', arguments: {} },
+      ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
+    }
+    const mcpEnd = JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:00:05Z',
+      payload: endPayload,
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', `rollout-mcp-no-duration-${durationMs ?? 'missing'}.jsonl`, [
+      sessionMeta({ session_id: `sess-mcp-no-duration-${durationMs ?? 'missing'}`, model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      userMessage('use the fixture MCP server', '2026-04-14T10:00:00Z'),
+      mcpEnd,
+      functionCall('list_resources', '2026-04-14T10:00:02Z', { namespace: 'mcp__fixture', callId: 'mcp-no-duration' }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:05Z', payload: { type: 'function_call_output', call_id: 'mcp-no-duration', output: 'done' } }),
+      tokenCount({ timestamp: '2026-04-14T10:00:08Z', last: { input: 300, output: 100 }, total: { input: 300, output: 100, total: 400 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      tools: ['mcp__fixture__list_resources'],
+      activeDurationMs: 7000,
+      toolWaitMs: 3000,
+    })
+  })
+
+  it('keeps the earliest MCP response-call start when a duplicate start repeats', async () => {
+    const noDurationMcpEnd = JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:00:05Z',
+      payload: {
+        type: 'mcp_tool_call_end',
+        call_id: 'mcp-repeated-start',
+        invocation: { server: 'fixture', tool: 'list_resources', arguments: {} },
+      },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-repeated-start.jsonl', [
+      sessionMeta({ session_id: 'sess-mcp-repeated-start', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      userMessage('use the fixture MCP server', '2026-04-14T10:00:00Z'),
+      functionCall('list_resources', '2026-04-14T10:00:01Z', { namespace: 'mcp__fixture', callId: 'mcp-repeated-start' }),
+      functionCall('list_resources', '2026-04-14T10:00:03Z', { namespace: 'mcp__fixture', callId: 'mcp-repeated-start' }),
+      noDurationMcpEnd,
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:05Z', payload: { type: 'function_call_output', call_id: 'mcp-repeated-start', output: 'done' } }),
+      tokenCount({ timestamp: '2026-04-14T10:00:08Z', last: { input: 300, output: 100 }, total: { input: 300, output: 100, total: 400 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      tools: ['mcp__fixture__list_resources'],
+      activeDurationMs: 6000,
+      toolWaitMs: 4000,
+    })
+  })
+
   it('reads an MCP namespace from a large function_call record', async () => {
     const largeFunctionCall = JSON.stringify({
       type: 'response_item',
@@ -1022,6 +1094,61 @@ describe('codex provider - JSONL parsing', () => {
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.tools).toEqual(['mcp__fixture__list_resources', 'mcp__fixture__get_status', 'list_resources'])
+  })
+
+  it('reads direct large response names after nested name and MCP field decoys', async () => {
+    const largeFunctionCall = JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:30Z',
+      payload: {
+        type: 'function_call',
+        arguments: {
+          name: 'nested_function_decoy',
+          namespace: 'mcp__nested',
+          call_id: 'nested-function-id',
+          body: 'x'.repeat(80_000),
+        },
+        name: 'list_resources',
+        namespace: 'mcp__fixture',
+        call_id: 'direct-function-id',
+      },
+    })
+    const nestedCustomInput = JSON.stringify({
+      name: 'nested_custom_decoy',
+      namespace: 'mcp__nested',
+      call_id: 'nested-custom-id',
+      body: 'x'.repeat(80_000),
+    })
+    const largeCustomCall = JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:31Z',
+      payload: {
+        type: 'custom_tool_call',
+        input: nestedCustomInput,
+        name: 'get_status',
+        namespace: 'mcp__fixture',
+        call_id: 'direct-custom-id',
+      },
+    })
+    expect(Buffer.byteLength(largeFunctionCall)).toBeGreaterThan(64 * 1024)
+    expect(Buffer.byteLength(largeCustomCall)).toBeGreaterThan(64 * 1024)
+
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-direct-name.jsonl', [
+      sessionMeta({ session_id: 'sess-mcp-direct-name', model: 'gpt-5.5' }),
+      userMessage('use the fixture MCP server'),
+      largeFunctionCall,
+      mcpToolCallEnd('fixture', 'list_resources', '2026-04-14T10:00:30Z', 'direct-function-id'),
+      largeCustomCall,
+      mcpToolCallEnd('fixture', 'get_status', '2026-04-14T10:00:31Z', 'direct-custom-id'),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['mcp__fixture__list_resources', 'mcp__fixture__get_status'])
   })
 
   it('keeps MCP namespace attribution identical on full and append parsing', async () => {

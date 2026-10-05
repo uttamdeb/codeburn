@@ -510,6 +510,12 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
     type === 'session_meta'
       ? getRawJsonStringField(getRawPayloadFieldWindow(line, field) ?? '', field)
       : getRawJsonStringField(pHead, field)
+  // Response-call arguments/input may contain same-named fields before the
+  // shallow function/custom-tool name. These records can exceed the compact
+  // head, so read the direct payload field without searching nested decoys.
+  const responseName = payloadType === 'function_call' || payloadType === 'custom_tool_call'
+    ? getRawJsonStringField(getRawPayloadFieldWindow(line, 'name') ?? '', 'name')
+    : payloadString('name')
   const compactModel = payloadString('model')
   const compactModelName = getRawJsonStringField(pHead, 'model_name')
   const compactLastUsage = getRawTokenUsage(pHead, 'last_token_usage')
@@ -537,7 +543,7 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
         ? getRawJsonStringField(getRawPayloadFieldWindow(line, 'source') ?? '', 'parent_thread_id')
         : undefined,
       model: compactModel,
-      name: payloadString('name'),
+      name: responseName,
       invocation,
       call_id: callIdAfterPotentiallyLargeContent
         ? getRawJsonStringField(getRawPayloadFieldWindow(line, 'call_id') ?? '', 'call_id')
@@ -1152,7 +1158,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             if (typeof input === 'string') attributeShellCommand(input, false)
           }
           const started = entry.timestamp ? Date.parse(entry.timestamp) : NaN
-          if (!duplicateMcpCall && callId && Number.isFinite(started)) openToolStarts.set(callId, started)
+          // A matching mcp_tool_call_end may have supplied the attribution
+          // first, but no usable duration. Keep the first finite response-call
+          // start even for that duplicate so the output record can recover its
+          // wait interval. Repeated response records must not move the start.
+          if (callId && Number.isFinite(started) && !openToolStarts.has(callId)) openToolStarts.set(callId, started)
           if (!duplicateMcpCall) pendingToolSequence.push([call])
           continue
         }
