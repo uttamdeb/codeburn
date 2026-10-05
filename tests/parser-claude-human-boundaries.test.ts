@@ -1,10 +1,14 @@
-import { copyFile, mkdtemp, rm } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-import { compactEntry, groupIntoTurns, parseClaudeFileFull, parseJsonlLine } from '../src/parser.js'
-import type { JournalEntry } from '../src/types.js'
+import { clearSessionCache, compactEntry, groupIntoTurns, parseAllSessions, parseClaudeFileFull, parseJsonlLine } from '../src/parser.js'
+import { PROVIDER_ENV_VARS, PROVIDER_PARSE_VERSIONS } from '../src/session-cache.js'
+import type { DateRange, JournalEntry } from '../src/types.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
+import { setHome } from './setup/home.js'
 
 const timestamp = (second: number) => `2026-10-05T10:00:${String(second).padStart(2, '0')}.000Z`
 
@@ -47,7 +51,7 @@ describe('Claude human turn boundaries', () => {
 
       const parsed = await parseClaudeFileFull(file, new Set())
       expect(parsed?.turns).toHaveLength(1)
-      expect(parsed?.turns[0]?.userMessage).toBe('Implement a feature')
+      expect(parsed?.turns[0]?.userMessage).toBe('Implement a parser change in src/parser.ts')
       expect(parsed?.turns[0]?.calls).toHaveLength(4)
       expect(parsed?.turns[0]?.calls.reduce((sum, call) => sum + call.usage.inputTokens, 0)).toBe(4000)
       expect(parsed?.turns[0]?.calls.reduce((sum, call) => sum + call.usage.outputTokens, 0)).toBe(400)
@@ -111,5 +115,103 @@ describe('Claude human turn boundaries', () => {
       '/Users/uttam/project/src/parser.ts',
       'Please inspect this file',
     ])
+  })
+
+  it('reparses an older cached grouping and reclassifies the retained billed calls', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'claude-human-cache-home-'))
+    const cacheDir = await mkdtemp(join(tmpdir(), 'claude-human-cache-'))
+    const envKeys = [
+      'HOME',
+      'USERPROFILE',
+      'CLAUDE_CONFIG_DIR',
+      'CLAUDE_CONFIG_DIRS',
+      'CODEBURN_CACHE_DIR',
+      'CODEBURN_DESKTOP_SESSIONS_DIR',
+    ] as const
+    const previousEnv = new Map(envKeys.map(key => [key, process.env[key]]))
+
+    try {
+      setHome(home)
+      const claudeDir = join(home, '.claude')
+      const projectDir = join(claudeDir, 'projects', 'human-boundaries')
+      const sessionPath = join(projectDir, 'human-boundaries.jsonl')
+      await mkdir(projectDir, { recursive: true })
+      await copyFile(resolve('tests/fixtures/claude/harness-human-boundaries.jsonl'), sessionPath)
+      process.env['CLAUDE_CONFIG_DIR'] = claudeDir
+      delete process.env['CLAUDE_CONFIG_DIRS']
+      process.env['CODEBURN_CACHE_DIR'] = cacheDir
+      process.env['CODEBURN_DESKTOP_SESSIONS_DIR'] = join(home, 'desktop-sessions')
+
+      const range: DateRange = {
+        start: new Date('2026-10-05T00:00:00.000Z'),
+        end: new Date('2026-10-05T23:59:59.999Z'),
+      }
+      const summarize = async () => {
+        const projects = await parseAllSessions(range, 'claude')
+        const session = projects.flatMap(project => project.sessions).find(candidate => candidate.sessionId === 'human-boundaries')
+        expect(session).toBeDefined()
+        return {
+          turns: session!.turns.map(turn => ({
+            userMessage: turn.userMessage,
+            category: turn.category,
+            calls: turn.assistantCalls.map(call => call.deduplicationKey),
+          })),
+          apiCalls: session!.apiCalls,
+          totalInputTokens: session!.totalInputTokens,
+          totalOutputTokens: session!.totalOutputTokens,
+        }
+      }
+
+      clearSessionCache()
+      const cold = await summarize()
+      expect(cold).toMatchObject({
+        turns: [{
+          userMessage: 'Implement a parser change in src/parser.ts',
+          category: 'feature',
+          calls: ['response-1', 'response-2', 'response-3', 'response-4'],
+        }],
+        apiCalls: 4,
+        totalInputTokens: 4000,
+        totalOutputTokens: 400,
+      })
+
+      // The old parser grouped each harness record as a separate human turn.
+      // Give the warm cache that old version's fingerprint and turns so the
+      // parser-version migration must rebuild them from the transcript.
+      const cache = await readCacheOnDisk()
+      const section = cache.providers['claude']!
+      const file = section.files[sessionPath]!
+      const firstTurn = file.turns[0]!
+      const calls = file.turns.flatMap(turn => turn.calls)
+      const oldPrompts = [
+        'Implement a parser change in src/parser.ts',
+        'Skill body injected by the harness',
+        'Background task is complete',
+        'Summary of the prior conversation',
+      ]
+      file.turns = calls.map((call, index) => ({
+        ...firstTurn,
+        userMessage: oldPrompts[index]!,
+        timestamp: timestamp(index * 2),
+        calls: [call],
+      }))
+      const oldParserVersion = PROVIDER_PARSE_VERSIONS['claude']!.replace(/-human-turn-boundaries-v1$/, '')
+      const fingerprintParts = PROVIDER_ENV_VARS['claude']!.map(key => `${key}=${process.env[key] ?? ''}`)
+      fingerprintParts.push(`parser=${oldParserVersion}`)
+      section.envFingerprint = createHash('sha256').update(fingerprintParts.join('\0')).digest('hex').slice(0, 16)
+      await writeCacheOnDisk(cache)
+
+      clearSessionCache()
+      expect(await summarize()).toEqual(cold)
+    } finally {
+      clearSessionCache()
+      for (const key of envKeys) {
+        const value = previousEnv.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(home, { recursive: true, force: true })
+      await rm(cacheDir, { recursive: true, force: true })
+    }
   })
 })

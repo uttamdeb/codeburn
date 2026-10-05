@@ -365,6 +365,12 @@ function readJsonString(source: JsonSource, bounds: JsonValueBounds | null, cap 
   return readJsonStringBuffer(source.raw, bounds, cap)
 }
 
+function readJsonBoolean(source: JsonSource, bounds: JsonValueBounds | null): boolean | undefined {
+  if (bounds?.kind !== 'scalar') return undefined
+  const value = source.slice(bounds.start, bounds.end)
+  return value === 'true' ? true : value === 'false' ? false : undefined
+}
+
 function readJsonNumberField(source: JsonSource, objectBounds: JsonValueBounds | null, field: string): number | undefined {
   if (!objectBounds || objectBounds.kind !== 'object') return undefined
   const bounds = findObjectFieldValue(source, objectBounds.start, objectBounds.end, field)
@@ -615,7 +621,7 @@ function extractObjectFields(
   return captured
 }
 
-const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain', 'promptSource'] as const
+const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain', 'promptSource', 'isMeta', 'isCompactSummary', 'origin'] as const
 const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content'] as const
 
 function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
@@ -631,6 +637,16 @@ function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
   const entry: JournalEntry = { type }
   if (root['isSidechain']?.kind === 'scalar' && source.slice(root['isSidechain'].start, root['isSidechain'].end) === 'true') {
     entry.isSidechain = true
+  }
+  const isMeta = readJsonBoolean(source, root['isMeta'])
+  const isCompactSummary = readJsonBoolean(source, root['isCompactSummary'])
+  if (isMeta !== undefined) entry.isMeta = isMeta
+  if (isCompactSummary !== undefined) entry.isCompactSummary = isCompactSummary
+  const originBounds = root['origin']
+  if (originBounds?.kind === 'object') {
+    const originFields = extractObjectFields(source, originBounds.start, originBounds.end, ['kind'])
+    const originKind = readJsonString(source, originFields['kind'])
+    if (originKind !== undefined) entry.origin = { kind: originKind }
   }
   const timestamp = readJsonString(source, root['timestamp'])
   const sessionId = readJsonString(source, root['sessionId'])
@@ -1003,9 +1019,17 @@ const QUEUED_SLASH_COMMAND = /^\/[a-z][\w:.-]*(?:\s|$)/
 // Peer and agent-message queued commands (`isMeta: true`, `origin.kind: "peer"`)
 // are queue plumbing between agents, not a prompt the user typed.
 function isHumanQueuedPrompt(a: Record<string, unknown>): boolean {
-  const origin = a['origin'] as { kind?: unknown } | undefined
   return a['type'] === 'queued_command' && a['commandMode'] === 'prompt'
-    && a['isMeta'] !== true && (origin?.kind ?? 'human') === 'human'
+    && isHumanPromptMetadata(a)
+}
+
+function isHumanPromptMetadata(metadata: Record<string, unknown>): boolean {
+  if (metadata['isMeta'] === true || metadata['isCompactSummary'] === true) return false
+  const origin = metadata['origin']
+  const kind = origin && typeof origin === 'object'
+    ? (origin as Record<string, unknown>)['kind']
+    : undefined
+  return (kind ?? 'human') === 'human'
 }
 
 function firstPlainText(value: unknown): string {
@@ -1028,6 +1052,15 @@ export function compactEntry(raw: JournalEntry): JournalEntry {
   if (raw.cwd !== undefined) entry.cwd = raw.cwd
   // Preserved so groupIntoTurns can stamp each turn's git branch (rich capture).
   if (typeof raw.gitBranch === 'string' && raw.gitBranch) entry.gitBranch = raw.gitBranch
+  // The turn grouper must distinguish human prompts from Claude's harness
+  // records before deciding whether a user message starts a new billed turn.
+  if (typeof raw.isMeta === 'boolean') entry.isMeta = raw.isMeta
+  if (typeof raw.isCompactSummary === 'boolean') entry.isCompactSummary = raw.isCompactSummary
+  const origin = raw.origin
+  if (origin && typeof origin === 'object') {
+    const kind = origin.kind
+    if (typeof kind === 'string') entry.origin = { kind }
+  }
   // Preserved so groupIntoTurns can attribute each PR reference to its turn.
   // Only `pr-link` entries carry `prUrl`; every other field of theirs is dropped.
   if (raw.type === 'pr-link') {
@@ -1657,7 +1690,7 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
     const entryBranch = typeof entry.gitBranch === 'string' && entry.gitBranch ? entry.gitBranch : undefined
     if (entry.type === 'user') {
       const text = getUserMessageText(entry)
-      if (text.trim()) {
+      if (text.trim() && isHumanPromptMetadata(entry as Record<string, unknown>)) {
         pushCurrentTurn()
         currentUserMessage = text
         currentCalls = []

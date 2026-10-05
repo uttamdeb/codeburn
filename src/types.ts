@@ -82,6 +82,9 @@ export type JournalEntry = {
   version?: string
   gitBranch?: string
   promptId?: string
+  isMeta?: boolean
+  isCompactSummary?: boolean
+  origin?: { kind?: unknown }
   message?: AssistantMessageContent | { role: 'user'; content: string | ContentBlock[] }
   isSidechain?: boolean
   [key: string]: unknown
