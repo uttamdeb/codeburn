@@ -409,8 +409,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // codex-token-usage-record-v1: prefer response-level usage records on newer
   // rollouts and retain the legacy-to-record handover state. Cached turns must
   // reparse because session-cache otherwise bypasses the provider parser.
-  // Compose both suffixes so cached sessions receive both accounting fixes.
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1-fork-replay-burst-v1-codex-token-usage-record-v1',
+  // codex-mcp-namespace-v1: join response function/custom-call MCP namespace
+  // and name, and deduplicate a matching mcp_tool_call_end. Cached attribution
+  // is stale.
+  // Compose the parser-change suffixes so warm sessions receive each fix.
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1-fork-replay-burst-v1-codex-token-usage-record-v1-codex-mcp-namespace-v1',
   // reported-cost-v1: cached Crush calls stored costUSD: undefined and must
   // re-parse to keep the recorded session cost.
   crush: 'reported-cost-v1',

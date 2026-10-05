@@ -38,6 +38,13 @@ The first line read is capped at 1 MB (`FIRST_LINE_READ_CAP`). Codex CLI 0.128+ 
 
 A session that yielded zero parseable lines does **not** write to the cache (`codex.ts:419`); this prevents a transient read failure from pinning an empty result against a fingerprint.
 
+Parser attribution changes also advance the `codex` provider parse version in the
+session cache. Codex result-cache v19 and the matching provider-version suffix
+cover namespaced MCP function and custom-tool calls, plus matching
+`mcp_tool_call_end` records. Daily cache v52 re-derives finalized days because
+corrected MCP tool names can change generic task categories to exploration;
+calls and billing remain unchanged.
+
 ## Deduplication
 
 Forked rollouts copy the parent's history before their own work. Replays with
@@ -67,6 +74,8 @@ Estimated events that fall back to char-counting use `codex:<sessionId>:<timesta
 - `prevCumulativeTotal` is initialized to `null`, not `0`. A session whose first event reports `total = 0` would otherwise be dropped as a "duplicate" of the initial state. `prevInfoIdentity` (the byte-identity string) is persisted in the resume state alongside it.
 - `prev*` token counters are advanced on every counted `token_count` event, including ones that used `last_token_usage`. Earlier code only updated them on the fallback branch, which double-counted any session that mixed modes.
 - OpenAI counts cached tokens **inside** `input_tokens`. The parser subtracts them so the rest of the codebase can assume Anthropic semantics (cached are separate).
+- A `response_item` function or custom-tool call can carry `namespace: "mcp__<server>"` separately from its `name`; CodeBurn combines them as `mcp__<server>__<tool>`. Existing qualified names stay as written, and the MCP namespace takes precedence over built-in aliases such as `exec_command`.
+- If one MCP execution appears as both a namespaced function call and `mcp_tool_call_end` with the same `call_id`, it is attributed once. These call IDs are scoped to the current task when deduplicating.
 
 ## Live quota (ChatGPT subscription)
 

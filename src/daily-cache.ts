@@ -256,7 +256,10 @@ import type { DateRange, ProjectSummary } from './types.js'
 // miss sessions there and must be re-derived after the default path is fixed.
 // v51: honor redirected Copilot and Cursor editor data roots. Backfill settled
 // days that previously missed usage stored under APPDATA or XDG_CONFIG_HOME.
-export const DAILY_CACHE_VERSION = 51
+// v52: Codex MCP namespaces on response tool calls move generic turns into
+// exploration. Re-derive finalized category totals after the corrected names;
+// call counts and billing remain unchanged.
+export const DAILY_CACHE_VERSION = 52
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at

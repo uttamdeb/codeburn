@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -11,6 +11,9 @@ import {
   toDateString,
   type DailyEntry,
 } from '../src/daily-cache.js'
+import { classifyTurn } from '../src/classifier.js'
+import { aggregateProjectsIntoDays } from '../src/day-aggregator.js'
+import type { ProjectSummary } from '../src/types.js'
 
 // One below the current version, so this pins the ADJACENT-version case: v20
 // is the SHIPPED predecessor (#1040, codex model attribution), and its days
@@ -68,6 +71,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  vi.useRealTimers()
   await rm(cacheRoot, { recursive: true, force: true })
 })
 
@@ -154,5 +158,104 @@ describe('daily-cache adoption of a v30 file written under a different accountin
     expect(carried?.carried).toBe(true)
     expect(loaded.pendingRederive).toContain('hermes')
     expect(loaded.pendingRederive).toContain('dsh')
+  })
+})
+
+describe('daily-cache re-derivation after Codex MCP tool categorization changes', () => {
+  it('refreshes a finalized v51 category with unchanged Codex calls and billing', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-05T12:00:00.000Z'))
+
+    const date = '2026-10-01'
+    const timestamp = `${date}T12:00:00.000Z`
+    const projectWithTool = (tool: string): ProjectSummary[] => {
+      const turn = classifyTurn({
+        userMessage: 'please',
+        timestamp,
+        sessionId: 'codex-mcp-daily-cache',
+        assistantCalls: [{
+          provider: 'codex',
+          model: 'GPT-5.5',
+          usage: {
+            inputTokens: 100,
+            outputTokens: 20,
+            cacheCreationInputTokens: 0,
+            cacheReadInputTokens: 0,
+            cachedInputTokens: 0,
+            reasoningTokens: 0,
+            webSearchRequests: 0,
+          },
+          costUSD: 1,
+          tools: [tool],
+          mcpTools: [],
+          skills: [],
+          subagentTypes: [],
+          hasAgentSpawn: false,
+          hasPlanMode: false,
+          speed: 'standard',
+          timestamp,
+          bashCommands: [],
+          deduplicationKey: 'codex-mcp-call-1',
+        }],
+      })
+
+      // aggregateProjectsIntoDays consumes the session identity, first
+      // timestamp, and turns; the remaining ProjectSummary fields are outside
+      // this regression's aggregation path.
+      return [{
+        project: 'codex-mcp-daily-cache',
+        projectPath: '/workspace/codex-mcp-daily-cache',
+        sessions: [{
+          project: 'codex-mcp-daily-cache',
+          firstTimestamp: timestamp,
+          turns: [turn],
+        }],
+      } as unknown as ProjectSummary]
+    }
+
+    const oldDay = aggregateProjectsIntoDays(projectWithTool('list_resources'))[0]!
+    const currentDay = aggregateProjectsIntoDays(projectWithTool('mcp__fixture__list_resources'))[0]!
+    const oldCache = {
+      version: 51,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: date,
+      days: [oldDay],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(cacheRoot, 'daily-cache.v51.json'), JSON.stringify(oldCache))
+
+    let parseCalls = 0
+    const hydrated = await ensureCacheHydrated(
+      async () => {
+        parseCalls++
+        return projectWithTool('mcp__fixture__list_resources')
+      },
+      projects => aggregateProjectsIntoDays(projects),
+    )
+
+    const refreshed = hydrated.days.find(entry => entry.date === date)!
+    expect(parseCalls).toBe(1)
+    expect(oldDay.categories).toHaveProperty('conversation')
+    expect(currentDay.categories).toHaveProperty('exploration')
+    expect(refreshed.categories).not.toHaveProperty('conversation')
+    expect(refreshed.categories).toHaveProperty('exploration')
+    expect(refreshed.providers['codex']?.categories).toEqual(currentDay.providers['codex']?.categories)
+    expect(refreshed).toMatchObject({
+      calls: oldDay.calls,
+      cost: oldDay.cost,
+      inputTokens: oldDay.inputTokens,
+      outputTokens: oldDay.outputTokens,
+      providers: {
+        codex: {
+          calls: oldDay.providers['codex']?.calls,
+          cost: oldDay.providers['codex']?.cost,
+          inputTokens: oldDay.providers['codex']?.inputTokens,
+          outputTokens: oldDay.providers['codex']?.outputTokens,
+        },
+      },
+    })
+    expect(refreshed.carried).toBeUndefined()
   })
 })
