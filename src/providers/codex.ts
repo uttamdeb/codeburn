@@ -49,6 +49,10 @@ const toolNameMap: Record<string, string> = {
   read_dir: 'Glob',
 }
 
+function toolAliasName(name: string): string {
+  return Object.hasOwn(toolNameMap, name) ? toolNameMap[name]! : name
+}
+
 // CLI-based MCP wrappers (e.g. philschmid/mcp-cli) let Codex call an MCP tool
 // through a shell command instead of registering the server natively. Codex
 // then logs a plain exec_command with no `mcp_tool_call_end` event, so the MCP
@@ -138,6 +142,7 @@ type CodexEntry = {
     role?: string
     cwd?: string
     response_id?: string
+    namespace?: string
     model_provider?: string
     model_name?: string
     originator?: string
@@ -275,6 +280,7 @@ function getRawJsonNumberField(head: string, field: string): number | undefined 
 
 function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4096): string | undefined {
   const payloadKey = Buffer.from('"payload"')
+  const fieldBytes = Buffer.from(field)
   const payloadIndex = source.indexOf(payloadKey)
   if (payloadIndex < 0) return undefined
   let payloadStart = source.indexOf(0x7b, payloadIndex + payloadKey.length) // {
@@ -302,10 +308,12 @@ function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4
         if (keyByte === 0x22) break
       }
       if (depth === 1 && keyEnd < source.length) {
-        const key = source.subarray(keyStart, keyEnd).toString('utf-8')
         let valueStart = keyEnd + 1
         while (valueStart < source.length && (source[valueStart] === 0x20 || source[valueStart] === 0x09 || source[valueStart] === 0x0a || source[valueStart] === 0x0d)) valueStart++
-        if (source[valueStart] === 0x3a && key === field) {
+        // Quoted scalar values are visited by the same scan. Check the
+        // following colon and short raw key length before comparing bytes so
+        // a large `arguments` or `input` string is never decoded as a key.
+        if (source[valueStart] === 0x3a && keyEnd - keyStart === fieldBytes.length && source.subarray(keyStart, keyEnd).equals(fieldBytes)) {
           return source.subarray(i, Math.min(source.length, i + windowBytes)).toString('utf-8')
         }
       }
@@ -316,7 +324,7 @@ function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4
     if (byte === 0x22) inString = true
     else if (byte === 0x7b || byte === 0x5b) depth++ // { or [
     else if (byte === 0x7d || byte === 0x5d) depth-- // } or ]
-    if (depth < 0) break
+    if (depth <= 0) break
   }
   return undefined
 }
@@ -389,6 +397,19 @@ function getRawInvocation(head: string): { server?: string; tool?: string } | un
   return server || tool ? { server, tool } : undefined
 }
 
+function responseToolName(name: unknown, namespace: unknown): string {
+  const rawName = typeof name === 'string' ? name : ''
+  // A qualified name is already canonical, even if a producer also includes
+  // the namespace field. MCP's namespace owns the name before built-in aliases
+  // are considered, so an MCP tool called `exec_command` is never reported as
+  // Bash.
+  if (rawName.startsWith('mcp__')) return rawName
+  if (typeof namespace === 'string' && namespace.startsWith('mcp__') && namespace.length > 5 && rawName) {
+    return `${namespace}__${rawName}`
+  }
+  return toolAliasName(rawName)
+}
+
 function countJsonStringBytes(source: Buffer, valueStart: number): number {
   let count = 0
   for (let i = valueStart; i < source.length; i++) {
@@ -458,6 +479,11 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
   const pHead = payloadHead(head)
   const payloadType = getRawJsonStringField(pHead, 'type')
   const role = getRawJsonStringField(pHead, 'role')
+  const callIdAfterPotentiallyLargeContent = payloadType === 'function_call'
+    || payloadType === 'custom_tool_call'
+    || payloadType === 'function_call_output'
+    || payloadType === 'custom_tool_call_output'
+    || payloadType === 'mcp_tool_call_end'
   // task_complete appends the potentially huge final assistant message before
   // its duration fields. Fall back to the full Buffer only for this event so
   // timing metadata is not lost when the compact head stops early.
@@ -499,6 +525,9 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
     payload: {
       type: payloadType,
       role,
+      namespace: (payloadType === 'function_call' || payloadType === 'custom_tool_call')
+        ? getRawJsonStringField(getRawPayloadFieldWindow(line, 'namespace') ?? '', 'namespace')
+        : undefined,
       cwd: payloadString('cwd'),
       model_provider: payloadString('model_provider'),
       originator: payloadString('originator'),
@@ -510,7 +539,9 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
       model: compactModel,
       name: payloadString('name'),
       invocation,
-      call_id: getRawJsonStringField(pHead, 'call_id'),
+      call_id: callIdAfterPotentiallyLargeContent
+        ? getRawJsonStringField(getRawPayloadFieldWindow(line, 'call_id') ?? '', 'call_id')
+        : getRawJsonStringField(pHead, 'call_id'),
       turn_id: getRawJsonStringField(pHead, 'turn_id'),
       // On mcp_tool_call_end a coincidental `duration_ms` inside the large
       // invocation.arguments object can shadow the payload-level duration, so the
@@ -778,6 +809,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
       // it), so the item side only ever cancels an attribution, never adds a
       // duplicate.
       const itemDedup = new Map<string, number>()
+      // If a Codex MCP execution also appears as mcp_tool_call_end, pair those
+      // representations by call_id, retaining the first attribution. Keep the
+      // sets task-local so IDs can be reused by a later task without growing
+      // for the lifetime of a large rollout.
+      const mcpResponseCallIds = new Set<string>()
+      const mcpEndCallIds = new Set<string>()
 
       /// The single classification pipeline every Codex shell-command shape
       /// feeds (#478): `function_call` arguments, the `exec` custom tool's JS
@@ -1042,6 +1079,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           taskStartedAt = Number.isFinite(startedAt) ? startedAt : undefined
           taskActiveStartedAt = undefined
           openToolStarts.clear()
+          mcpResponseCallIds.clear()
+          mcpEndCallIds.clear()
           // Everything decoded so far is now in `results` and the per-task
           // accumulators are empty: a clean restart point for an appended tail.
           resumeOffset = tracker.lastCompleteLineOffset
@@ -1079,8 +1118,13 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
 
         if (entry.type === 'response_item' && (entry.payload?.type === 'function_call' || entry.payload?.type === 'custom_tool_call')) {
           const rawName = entry.payload.name ?? ''
-          const mapped = toolNameMap[rawName] ?? rawName
-          pendingTools.push(mapped)
+          const mapped = responseToolName(rawName, entry.payload.namespace)
+          const callId = entry.payload.call_id
+          const isMcpCall = mapped.startsWith('mcp__')
+          const duplicateMcpCall = isMcpCall && typeof callId === 'string'
+            && (mcpResponseCallIds.has(callId) || mcpEndCallIds.has(callId))
+          if (isMcpCall && typeof callId === 'string') mcpResponseCallIds.add(callId)
+          if (!duplicateMcpCall) pendingTools.push(mapped)
           const call: ToolCall = { tool: mapped }
           const rawArgs = (entry.payload as Record<string, unknown>)['arguments']
           const args = typeof rawArgs === 'string'
@@ -1107,10 +1151,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             const input = (entry.payload as Record<string, unknown>)['input']
             if (typeof input === 'string') attributeShellCommand(input, false)
           }
-          const callId = entry.payload.call_id
           const started = entry.timestamp ? Date.parse(entry.timestamp) : NaN
-          if (callId && Number.isFinite(started)) openToolStarts.set(callId, started)
-          pendingToolSequence.push([call])
+          if (!duplicateMcpCall && callId && Number.isFinite(started)) openToolStarts.set(callId, started)
+          if (!duplicateMcpCall) pendingToolSequence.push([call])
           continue
         }
 
@@ -1195,10 +1238,17 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           const inv = (entry.payload as Record<string, unknown>)['invocation'] as Record<string, unknown> | undefined
           const server = typeof inv?.['server'] === 'string' ? inv['server'] as string : ''
           const tool = typeof inv?.['tool'] === 'string' ? inv['tool'] as string : ''
-          if (server && tool) {
+          const callId = entry.payload.call_id
+          const hasMcpName = Boolean(server && tool)
+          const duplicateMcpCall = hasMcpName && typeof callId === 'string'
+            && (mcpEndCallIds.has(callId) || mcpResponseCallIds.has(callId))
+          if (hasMcpName && typeof callId === 'string') mcpEndCallIds.add(callId)
+          if (hasMcpName) {
             const name = `mcp__${server}__${tool}`
-            pendingTools.push(name)
-            pendingToolSequence.push([{ tool: name }])
+            if (!duplicateMcpCall) {
+              pendingTools.push(name)
+              pendingToolSequence.push([{ tool: name }])
+            }
           }
           continue
         }
@@ -1509,7 +1559,7 @@ export function createCodexProvider(
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return toolAliasName(rawTool)
     },
 
     // Trees discoverSessions actually walks. Honors CODEX_HOME; when the

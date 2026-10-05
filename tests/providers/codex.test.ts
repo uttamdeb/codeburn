@@ -102,6 +102,20 @@ function functionCall(name: string, timestamp?: string, opts: { namespace?: stri
   })
 }
 
+function customToolCall(name: string, timestamp?: string, opts: { namespace?: string; callId?: string; input?: string } = {}) {
+  return JSON.stringify({
+    type: 'response_item',
+    timestamp: timestamp ?? '2026-04-14T10:00:30Z',
+    payload: {
+      type: 'custom_tool_call',
+      name,
+      ...(opts.namespace ? { namespace: opts.namespace } : {}),
+      ...(opts.callId ? { call_id: opts.callId } : {}),
+      ...(opts.input !== undefined ? { input: opts.input } : {}),
+    },
+  })
+}
+
 function mcpToolCallEnd(server: string, tool: string, timestamp?: string, callId = 'call-1') {
   return JSON.stringify({
     type: 'event_msg',
@@ -879,9 +893,15 @@ describe('codex provider - JSONL parsing', () => {
       functionCall('exec_command', '2026-04-14T10:00:31Z', { namespace: 'mcp__fixture', callId: 'mcp-exec' }),
       // A provider that already supplies a qualified name must not be prefixed again.
       functionCall('mcp__fixture__already_qualified', '2026-04-14T10:00:32Z', { namespace: 'mcp__fixture' }),
+      customToolCall('get_status', '2026-04-14T10:00:32Z', { namespace: 'mcp__fixture', callId: 'mcp-custom' }),
+      customToolCall('exec', '2026-04-14T10:00:32Z', { namespace: 'functions' }),
+      customToolCall('apply_patch', '2026-04-14T10:00:32Z', { namespace: 'functions' }),
       // Non-MCP namespaces keep the existing plain-name behavior.
       functionCall('list_resources', '2026-04-14T10:00:33Z', { namespace: 'functions' }),
       functionCall('exec_command', '2026-04-14T10:00:34Z'),
+      // Prototype-like names remain plain strings instead of becoming object methods.
+      functionCall('constructor', '2026-04-14T10:00:34Z'),
+      functionCall('__proto__', '2026-04-14T10:00:34Z'),
       // Some rollouts can carry both representations of one execution.
       // Matching call IDs must not double-count the MCP tool.
       mcpToolCallEnd('fixture', 'list_resources', '2026-04-14T10:00:35Z', 'mcp-list'),
@@ -889,6 +909,8 @@ describe('codex provider - JSONL parsing', () => {
     ])
 
     const provider = createCodexProvider(tmpDir)
+    expect(provider.toolDisplayName('constructor')).toBe('constructor')
+    expect(provider.toolDisplayName('__proto__')).toBe('__proto__')
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
 
@@ -897,22 +919,100 @@ describe('codex provider - JSONL parsing', () => {
       'mcp__fixture__list_resources',
       'mcp__fixture__exec_command',
       'mcp__fixture__already_qualified',
+      'mcp__fixture__get_status',
+      'Bash',
+      'Edit',
       'list_resources',
       'Bash',
+      'constructor',
+      '__proto__',
     ])
   })
 
+  it('deduplicates reverse-ordered MCP records without resetting tool timing', async () => {
+    const mcpEnd = JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:00:05Z',
+      payload: {
+        type: 'mcp_tool_call_end',
+        call_id: 'mcp-reverse',
+        invocation: { server: 'fixture', tool: 'list_resources', arguments: {} },
+        duration: { secs: 3, nanos: 0 },
+      },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-reverse-order.jsonl', [
+      sessionMeta({ session_id: 'sess-mcp-reverse', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      userMessage('use the fixture MCP server', '2026-04-14T10:00:00Z'),
+      // The end event is encountered first even though the function call's
+      // timestamp is earlier. The event carries the full three-second wait.
+      mcpEnd,
+      functionCall('list_resources', '2026-04-14T10:00:02Z', { namespace: 'mcp__fixture', callId: 'mcp-reverse' }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:05Z', payload: { type: 'function_call_output', call_id: 'mcp-reverse', output: 'done' } }),
+      tokenCount({ timestamp: '2026-04-14T10:00:08Z', last: { input: 300, output: 100 }, total: { input: 300, output: 100, total: 400 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      tools: ['mcp__fixture__list_resources'],
+      activeDurationMs: 7000,
+      toolWaitMs: 3000,
+    })
+  })
+
   it('reads an MCP namespace from a large function_call record', async () => {
-    const largeFunctionCall = functionCall('list_resources', '2026-04-14T10:00:30Z', {
-      namespace: 'mcp__fixture',
-      callId: 'mcp-large',
-      arguments: { body: 'x'.repeat(80_000) },
+    const largeFunctionCall = JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:30Z',
+      payload: {
+        type: 'function_call',
+        name: 'list_resources',
+        arguments: { namespace: 'mcp__nested', call_id: 'nested-function-id', body: 'x'.repeat(80_000) },
+        // Codex can put call_id after the potentially huge arguments object.
+        call_id: 'mcp-large',
+        namespace: 'mcp__fixture',
+      },
+    })
+    const largeCustomCall = JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:31Z',
+      payload: {
+        type: 'custom_tool_call',
+        name: 'get_status',
+        input: 'x'.repeat(80_000),
+        // The custom-tool payload may likewise place call_id after its input.
+        call_id: 'mcp-large-custom',
+        namespace: 'mcp__fixture',
+      },
+    })
+    const largeNamespaceDecoy = JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:32Z',
+      payload: {
+        type: 'function_call',
+        name: 'list_resources',
+        call_id: 'mcp-decoy',
+        arguments: { namespace: 'mcp__nested', body: 'x'.repeat(80_000) },
+      },
+      namespace: 'mcp__root',
+      sibling: { namespace: 'mcp__sibling' },
     })
     expect(Buffer.byteLength(largeFunctionCall)).toBeGreaterThan(64 * 1024)
+    expect(Buffer.byteLength(largeCustomCall)).toBeGreaterThan(64 * 1024)
+    expect(Buffer.byteLength(largeNamespaceDecoy)).toBeGreaterThan(64 * 1024)
     const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-namespace-large.jsonl', [
       sessionMeta({ session_id: 'sess-mcp-namespace-large', model: 'gpt-5.5' }),
       userMessage('use the fixture MCP server'),
       largeFunctionCall,
+      mcpToolCallEnd('fixture', 'list_resources', '2026-04-14T10:00:30Z', 'mcp-large'),
+      largeCustomCall,
+      mcpToolCallEnd('fixture', 'get_status', '2026-04-14T10:00:31Z', 'mcp-large-custom'),
+      largeNamespaceDecoy,
       tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
     ])
 
@@ -921,7 +1021,7 @@ describe('codex provider - JSONL parsing', () => {
     for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) calls.push(call)
 
     expect(calls).toHaveLength(1)
-    expect(calls[0]!.tools).toEqual(['mcp__fixture__list_resources'])
+    expect(calls[0]!.tools).toEqual(['mcp__fixture__list_resources', 'mcp__fixture__get_status', 'list_resources'])
   })
 
   it('keeps MCP namespace attribution identical on full and append parsing', async () => {
@@ -947,7 +1047,7 @@ describe('codex provider - JSONL parsing', () => {
         JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:01:01Z', payload: { type: 'task_started', turn_id: 'turn-2' } }),
         userMessage('second MCP request', '2026-04-14T10:01:02Z'),
         functionCall('get_status', '2026-04-14T10:01:30Z', { namespace: 'mcp__fixture', callId: 'mcp-second' }),
-        tokenCount({ timestamp: '2026-04-14T10:01:40Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+        tokenCount({ timestamp: '2026-04-14T10:01:40Z', last: { input: 500, output: 100 }, total: { input: 500, output: 100, total: 600 } }),
         JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:01:41Z', payload: { type: 'task_complete', duration_ms: 40_000 } }),
       ].join('\n') + '\n')
 
